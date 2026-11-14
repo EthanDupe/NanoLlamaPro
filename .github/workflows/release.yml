@@ -1,0 +1,30 @@
+name: Auto Release NanoLlamaPro
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Package release zip
+        run: |
+          zip -j NanoLlamaPro-Release.zip nanollama_pro.py self_train.py launch_nanollama.py training_data.txt README.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.${{ github.run_number }}
+          name: NanoLlamaPro v1.${{ github.run_number }}
+          generate_release_notes: true
+          files: |
+            NanoLlamaPro-Release.zip
+            launch_nanollama.py

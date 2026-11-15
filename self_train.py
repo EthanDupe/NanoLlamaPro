@@ -22,12 +22,8 @@ import os
 import random
 import re
 import shutil
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
-import socket
 import ssl
 import subprocess
-import threading
 import sys
 import time
 import traceback
@@ -591,7 +587,50 @@ CORE_CHAT_PAIRS: list[tuple[str, str]] = [
     ("what can you do", "I can answer questions, explain topics from science and history, and chat with you."),
     ("thanks", "You are welcome! Let me know if you need anything else."),
     ("what", "Could you tell me what topic or question you would like me to explain?"),
+    ("why is the ocean salty?", "Rivers carry dissolved minerals and salts from rocks into the ocean, and water evaporates while the salt stays behind."),
+    ("how do plants make food?", "Plants use photosynthesis to turn sunlight, water, and carbon dioxide into sugar and oxygen."),
+    ("what is the sun?", "The Sun is a G-type main-sequence star at the center of our solar system."),
+    ("how many planets are in the solar system?", "There are eight planets in our solar system: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, and Neptune."),
+    ("what is photosynthesis?", "Photosynthesis is the process plants use to convert light energy into chemical energy."),
+    ("explain machine learning", "Machine learning is a branch of artificial intelligence where computers learn patterns from data instead of following fixed rules."),
+    ("what is a neural network?", "A neural network is a computing system inspired by biological brains that learns patterns through layers of connected weights."),
 ]
+
+
+def fetch_open_qa_pairs(data_dir: str, max_new: int = 25) -> list[tuple[str, str]]:
+    """Fetches clean factual Q&A pairs from OpenTDB and caches them locally for offline reuse."""
+    cache_path = os.path.join(data_dir, "sft_qa.jsonl")
+    pairs: list[tuple[str, str]] = []
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    obj = json.loads(ln)
+                    pairs.append((obj["q"], obj["a"]))
+        except Exception:
+            pass
+    try:
+        url = f"https://opentdb.com/api.php?amount={min(40, max_new)}&type=multiple"
+        data = json.loads(http_get_text(url, timeout=8))
+        new_items = []
+        for item in data.get("results", []):
+            q = html_lib.unescape(item.get("question", "")).strip()
+            a = html_lib.unescape(item.get("correct_answer", "")).strip()
+            cat = html_lib.unescape(item.get("category", "General")).strip()
+            if q and a:
+                ans = f"In {cat}, the answer is {a}."
+                new_items.append((q, ans))
+        if new_items:
+            os.makedirs(data_dir, exist_ok=True)
+            existing = set(pairs)
+            with open(cache_path, "a", encoding="utf-8") as f:
+                for q, a in new_items:
+                    if (q, a) not in existing:
+                        f.write(json.dumps({"q": q, "a": a}) + "\n")
+                        pairs.append((q, a))
+    except Exception:
+        pass
+    return pairs
 
 
 MULTI_TURN_CHATS: list[list[tuple[str, str]]] = [
@@ -602,9 +641,13 @@ MULTI_TURN_CHATS: list[list[tuple[str, str]]] = [
 ]
 
 
-def build_sft_qa_pairs(docs: list[str], count: int = 40) -> list:
-    """Builds conversational, multi-turn, and <THINK>-grounded SFT examples."""
+def build_sft_qa_pairs(docs: list[str], count: int = 40, data_dir: str | None = None) -> list:
+    """Builds conversational, multi-turn, open Q&A, and <THINK>-grounded SFT examples."""
     qa: list = list(CORE_CHAT_PAIRS) + list(MULTI_TURN_CHATS)
+    if data_dir:
+        open_qa = fetch_open_qa_pairs(data_dir, max_new=20)
+        if open_qa:
+            qa.extend(random.sample(open_qa, min(len(open_qa), 20)))
     if not docs:
         return qa
     sample = random.sample(docs, min(len(docs), count))
@@ -782,9 +825,19 @@ def run_self_training_cycle(
             progress_cb=lambda c, t, e: print_progress(c, t, "Packing", e, start_time=t_pack),
         )
 
+    # Adaptive LR decay as total steps grow so Val Loss settles smoothly
+    cycle_lr = max(lr * 0.25, lr * (0.96 ** (model.step_count // 1000)))
+
+    # Live re-pack all docs (including incoming cluster_*.txt from workers) every 5 cycles
+    if cycle_idx % 5 == 0 and model.docs:
+        t_repack = time.monotonic()
+        model._prepare_sequences(
+            progress_cb=lambda c, t, e: print_progress(c, t, "Re-Packing", e, start_time=t_repack)
+        )
+
     ema_loss = model.train_steps(
         num_steps=train_steps,
-        max_lr=lr,
+        max_lr=cycle_lr,
         batch_size=batch_size,
         extra_seqs=extra_seqs,
         extra_ratio=0.40 if extra_seqs else 0.0,
@@ -814,7 +867,7 @@ def run_self_training_cycle(
 
     # 5. Instruction/Chat SFT AFTER GRPO (Loss Masked on <USER> Tokens)
     if sft_steps > 0 and model.docs:
-        qa_pairs = build_sft_qa_pairs(model.docs, count=30) + list(CORE_CHAT_PAIRS)
+        qa_pairs = build_sft_qa_pairs(model.docs, count=30, data_dir=data_dir) + list(CORE_CHAT_PAIRS)
         model.train_sft_steps(
             qa_pairs=qa_pairs,
             num_steps=sft_steps,
@@ -854,283 +907,6 @@ def run_self_training_cycle(
 
 
 # ---------------------------------------------------------------------------
-# 5b. LAN Distributed Training (Host FedAvg Server + Auto-Discover Worker)
-# ---------------------------------------------------------------------------
-CLUSTER_PORT = 8765
-BEACON_PORT = 8766
-
-
-def _get_local_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
-def _probe_host_port(ip: str, port: int = CLUSTER_PORT, timeout: float = 0.15) -> str | None:
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as s:
-            s.sendall(b"GET /status HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
-            resp = s.recv(512).decode("utf-8", errors="ignore")
-            if '"step"' in resp and '"merges"' in resp:
-                return f"{ip}:{port}"
-    except Exception:
-        return None
-    return None
-
-
-def _discover_lan_host(timeout: float = 2.5) -> str | None:
-    """Auto-discovers a NanoLlamaPro host via UDP beacon + fast /24 LAN TCP scan."""
-    t_scan = time.monotonic()
-    print_progress(1, 3, "LAN Scan", "listening for host beacon...", start_time=t_scan)
-    # 1. Fast UDP beacon check
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.settimeout(timeout)
-    try:
-        sock.bind(("", BEACON_PORT))
-        data, addr = sock.recvfrom(1024)
-        msg = data.decode("utf-8", errors="ignore")
-        if msg.startswith("NANOLLAMA_HOST:"):
-            port = msg.split(":", 1)[1].strip()
-            return f"{addr[0]}:{port}"
-    except Exception:
-        pass
-    finally:
-        sock.close()
-
-    print_progress(2, 3, "LAN Scan", "scanning local subnet...", start_time=t_scan)
-    # 2. Fast parallel /24 subnet TCP scan (works even if UDP broadcast is blocked)
-    local_ip = _get_local_ip()
-    if local_ip == "127.0.0.1" or "." not in local_ip:
-        return None
-    prefix = ".".join(local_ip.split(".")[:3])
-    found: list[str] = []
-    lock = threading.Lock()
-
-    def _scan_range(ips: list[str]):
-        for ip in ips:
-            if found:
-                return
-            hit = _probe_host_port(ip, CLUSTER_PORT, timeout=0.12)
-            if hit:
-                with lock:
-                    found.append(hit)
-                return
-
-    targets = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
-    threads = []
-    chunk = 16
-    for i in range(0, len(targets), chunk):
-        t = threading.Thread(target=_scan_range, args=(targets[i:i + chunk],), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=1.5)
-    res = found[0] if found else None
-    print_progress(3, 3, "LAN Scan", f"found {res}" if res else "no host found", start_time=t_scan)
-    return res
-
-
-def start_cluster_host(model: NanoLlamaUltra, save_path: str, lock: threading.Lock, data_dir: str, seen_hashes: set[str], visited_topics: set[str], port: int = CLUSTER_PORT):
-    """Starts an HTTP FedAvg parameter server + UDP LAN discovery beacon."""
-    state = {"workers_seen": set(), "merges": 0}
-
-    class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass
-
-        def do_GET(self):
-            if self.path == "/checkpoint":
-                with lock:
-                    if not os.path.isfile(save_path):
-                        model.save(save_path)
-                    with open(save_path, "rb") as f:
-                        payload = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-            elif self.path == "/status":
-                body = json.dumps({
-                    "step": model.step_count,
-                    "workers": len(state["workers_seen"]),
-                    "merges": state["merges"],
-                }).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(404)
-                self.end_headers()
-
-        def do_POST(self):
-            if self.path == "/submit_weights":
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length)
-                worker_ip = self.client_address[0]
-                state["workers_seen"].add(worker_ip)
-                try:
-                    w_data = numpy.load(io.BytesIO(raw), allow_pickle=False)
-                    with lock:
-                        if model.use_torch and model._pt_model is not None:
-                            model._sync_torch_to_numpy()
-                        alpha = 0.35
-                        merged_keys = 0
-                        for key in w_data.files:
-                            if key.startswith("w::"):
-                                k = key[3:]
-                                if k in model.weights and model.weights[k].shape == w_data[key].shape:
-                                    model.weights[k] = (1.0 - alpha) * model.weights[k] + alpha * w_data[key].astype(numpy.float32)
-                                    merged_keys += 1
-                        if model.use_torch and model._pt_model is not None:
-                            model._sync_numpy_to_torch()
-                        model.save(save_path)
-                        state["merges"] += 1
-                    resp = json.dumps({"status": "merged", "keys": merged_keys, "merges": state["merges"]}).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(resp)
-                    print(f"\n[Cluster Host] Merged weights from {worker_ip} (total merges={state['merges']})")
-                except Exception as exc:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(str(exc).encode("utf-8"))
-            elif self.path == "/submit_data":
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length)
-                worker_ip = self.client_address[0]
-                state["workers_seen"].add(worker_ip)
-                try:
-                    payload = json.loads(raw.decode("utf-8"))
-                    lines = payload.get("lines", [])
-                    w_visited = payload.get("visited", [])
-                    with lock:
-                        b_path, added = save_batch(data_dir, f"cluster_{worker_ip.replace('.', '_')}", lines, seen_hashes)
-                        if added > 0:
-                            model.docs.extend(lines[:added] if b_path else [])
-                        for vt in w_visited:
-                            visited_topics.add(str(vt).lower())
-                    resp = json.dumps({"status": "ok", "added": added}).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(resp)
-                    if added > 0:
-                        print(f"\n[Cluster Host] Received +{added} new training docs from {worker_ip}")
-                except Exception as exc:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(str(exc).encode("utf-8"))
-            else:
-                self.send_response(404)
-                self.end_headers()
-
-    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    srv_thread.start()
-
-    stop_beacon = threading.Event()
-
-    def _beacon_loop():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = f"NANOLLAMA_HOST:{port}".encode("utf-8")
-        while not stop_beacon.is_set():
-            try:
-                sock.sendto(msg, ("255.255.255.255", BEACON_PORT))
-            except Exception:
-                pass
-            stop_beacon.wait(2.0)
-        sock.close()
-
-    threading.Thread(target=_beacon_loop, daemon=True).start()
-    local_ip = _get_local_ip()
-    print(f"[Cluster Host] Ready! Other PCs can join at: {local_ip}:{port} (UDP auto-discovery active)")
-    return server, stop_beacon
-
-
-def run_cluster_worker(host_addr: str, args, data_dir: str, seen_hashes: set[str], visited_topics: set[str], topic_queue: deque[str]) -> None:
-    base_url = host_addr if host_addr.startswith("http") else f"http://{host_addr}"
-    local_ckpt = os.path.join(SCRIPT_DIR, "_worker_sync.npz")
-    print(f"[Cluster Worker] Connecting to host {base_url}...")
-
-    cycle = 0
-    while args.forever or cycle < max(1, args.cycles):
-        cycle += 1
-        # 1. Pull latest global checkpoint from host
-        req = urllib.request.Request(f"{base_url}/checkpoint", headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            with open(local_ckpt, "wb") as f:
-                f.write(resp.read())
-
-        model = NanoLlamaUltra.from_checkpoint(local_ckpt, device=get_best_device())
-        combined_text, _, _ = load_all_training_text(data_dir, os.path.join(SCRIPT_DIR, args.data))
-        if combined_text.strip():
-            model.load_text(combined_text, fit_new=False)
-
-        docs_before = len(model.docs)
-
-        # 2. Train 1 local cycle
-        run_self_training_cycle(
-            model=model,
-            cycle_idx=cycle,
-            data_dir=data_dir,
-            seen_hashes=seen_hashes,
-            visited_topics=visited_topics,
-            topic_queue=topic_queue,
-            wiki_pages=args.pages,
-            use_reddit=args.reddit,
-            train_steps=args.steps,
-            sft_steps=args.sft_steps,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            grpo_rounds=args.grpo,
-            save_path=local_ckpt,
-        )
-
-        # 2b. Send any new training data crawled by this worker to the Host
-        new_worker_docs = model.docs[docs_before:]
-        if new_worker_docs:
-            try:
-                data_payload = json.dumps({
-                    "lines": new_worker_docs,
-                    "visited": list(visited_topics)[-200:],
-                }).encode("utf-8")
-                d_req = urllib.request.Request(
-                    f"{base_url}/submit_data",
-                    data=data_payload,
-                    method="POST",
-                    headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-                )
-                with urllib.request.urlopen(d_req, timeout=20) as d_resp:
-                    d_info = json.loads(d_resp.read().decode("utf-8"))
-                    print(f"[Cluster Worker] Sent +{d_info.get('added', 0)} new training docs to Host")
-            except Exception as exc:
-                print(f"[Cluster Worker] Data sync warning: {exc}")
-
-        # 3. Push trained weights back to host for FedAvg merge
-        with open(local_ckpt, "rb") as f:
-            payload = f.read()
-        up_req = urllib.request.Request(
-            f"{base_url}/submit_weights",
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/octet-stream", "User-Agent": USER_AGENT},
-        )
-        with urllib.request.urlopen(up_req, timeout=30) as up_resp:
-            info = json.loads(up_resp.read().decode("utf-8"))
-            print(f"[Cluster Worker] Synced weights to host -> {info}")
-
-
-# ---------------------------------------------------------------------------
 # 6. Main CLI & Interactive Loop
 # ---------------------------------------------------------------------------
 def run() -> None:
@@ -1147,19 +923,17 @@ def run() -> None:
     parser.add_argument("--reddit", action="store_true", help="Also scrape Reddit subreddits.")
     parser.add_argument("--grpo", type=int, default=3, help="GRPO RL update rounds per cycle.")
     parser.add_argument("--topic", default="Artificial_intelligence", help="Starting Wikipedia topic.")
-    parser.add_argument("--dim", type=int, default=256 if is_gpu else 128, help="Embedding dimension.")
-    parser.add_argument("--layers", type=int, default=6 if is_gpu else 4, help="Transformer layers.")
+    parser.add_argument("--dim", type=int, default=256 if HAS_TORCH else 192, help="Embedding dimension.")
+    parser.add_argument("--layers", type=int, default=6 if HAS_TORCH else 4, help="Transformer layers.")
     parser.add_argument("--heads", type=int, default=8, help="Query attention heads.")
     parser.add_argument("--kv-heads", type=int, default=2, help="GQA KV heads.")
-    parser.add_argument("--block-size", type=int, default=192 if is_gpu else 128, help="Context window length.")
-    parser.add_argument("--vocab", type=int, default=3072 if is_gpu else 2048, help="Target BPE vocabulary size.")
+    parser.add_argument("--block-size", type=int, default=256 if HAS_TORCH else 160, help="Context window length.")
+    parser.add_argument("--vocab", type=int, default=4096 if HAS_TORCH else 3072, help="Target BPE vocabulary size.")
     parser.add_argument("--lr", type=float, default=0.004 if HAS_TORCH else 0.006, help="Peak learning rate.")
     parser.add_argument("--data", default="training_data.txt", help="Seed training text file.")
     parser.add_argument("--save", default="nanollama_pro.npz", help="Checkpoint file path (.npz).")
     parser.add_argument("--resume", default=None, help="Existing .npz checkpoint to resume.")
     parser.add_argument("--no-chat", action="store_true", help="Exit after training cycles.")
-    parser.add_argument("--host", action="store_true", help="Host a LAN distributed training cluster.")
-    parser.add_argument("--join", default=None, help="Join a LAN cluster host (e.g. 192.168.1.42:8765 or 'auto').")
     args = parser.parse_args()
 
     if len(sys.argv) == 1:
@@ -1167,40 +941,14 @@ def run() -> None:
         print("  [1] Continuous Self-Training (--forever)")
         print("  [2] Train 2 Cycles & Chat")
         print("  [3] Chat Only (skip training)")
-        print("  [4] Host Multi-PC Cluster (--host --forever)")
-        print("  [5] Join Multi-PC Cluster (--join)")
         try:
-            mode = input("Choose mode [1-5, default=2]: ").strip()
+            mode = input("Choose mode [1/2/3, default=2]: ").strip()
         except (EOFError, KeyboardInterrupt):
             mode = "2"
         if mode == "1":
             args.forever = True
-            print("Scanning local network for another NanoLlamaPro PC...")
-            found = _discover_lan_host(timeout=2.5)
-            if found:
-                print(f"[Auto-Cluster] Found running PC at {found}! Joining to train together...")
-                args.join = found
-            else:
-                print("[Auto-Cluster] No other PC found yet — starting as Host so others can auto-join!")
-                args.host = True
         elif mode == "3":
             args.cycles = 0
-        elif mode == "4":
-            args.host = True
-            args.forever = True
-        elif mode == "5":
-            args.forever = True
-            print("Searching local Wi-Fi/LAN for a host (4s)...")
-            found = _discover_lan_host(timeout=4.0)
-            if found:
-                print(f"Found host at {found}!")
-                args.join = found
-            else:
-                try:
-                    manual = input("Enter Host IP:Port (e.g. 192.168.1.42:8765): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    manual = ""
-                args.join = manual or "127.0.0.1:8765"
         else:
             args.cycles = 2
 
@@ -1265,18 +1013,7 @@ def run() -> None:
     shuffled_defaults = list(DEFAULT_TOPICS)
     random.shuffle(shuffled_defaults)
     topic_queue: deque[str] = deque([args.topic] + shuffled_defaults)
-    if args.join:
-        host_target = _discover_lan_host(timeout=4.0) if args.join == "auto" else args.join
-        if not host_target:
-            raise RuntimeError("Could not auto-discover a LAN host. Pass --join <IP:8765>.")
-        run_cluster_worker(host_target, args, data_dir, seen_hashes, visited_topics, topic_queue)
-        return
 
-    cluster_lock = threading.Lock()
-    cluster_srv = None
-    cluster_stop = None
-    if args.host:
-        cluster_srv, cluster_stop = start_cluster_host(model, save_path, cluster_lock, data_dir, seen_hashes, visited_topics)
 
     cycle = 0
 
@@ -1301,13 +1038,7 @@ def run() -> None:
             )
     except KeyboardInterrupt:
         print("\nSelf-training interrupted by user. Saving checkpoint...")
-        with cluster_lock:
-            model.save(save_path)
-    finally:
-        if cluster_stop:
-            cluster_stop.set()
-        if cluster_srv:
-            cluster_srv.shutdown()
+        model.save(save_path)
 
     if args.no_chat:
         return

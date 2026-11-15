@@ -936,7 +936,7 @@ def _discover_lan_host(timeout: float = 2.5) -> str | None:
     return res
 
 
-def start_cluster_host(model: NanoLlamaUltra, save_path: str, lock: threading.Lock, port: int = CLUSTER_PORT):
+def start_cluster_host(model: NanoLlamaUltra, save_path: str, lock: threading.Lock, data_dir: str, seen_hashes: set[str], visited_topics: set[str], port: int = CLUSTER_PORT):
     """Starts an HTTP FedAvg parameter server + UDP LAN discovery beacon."""
     state = {"workers_seen": set(), "merges": 0}
 
@@ -1003,6 +1003,32 @@ def start_cluster_host(model: NanoLlamaUltra, save_path: str, lock: threading.Lo
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write(str(exc).encode("utf-8"))
+            elif self.path == "/submit_data":
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                worker_ip = self.client_address[0]
+                state["workers_seen"].add(worker_ip)
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                    lines = payload.get("lines", [])
+                    w_visited = payload.get("visited", [])
+                    with lock:
+                        b_path, added = save_batch(data_dir, f"cluster_{worker_ip.replace('.', '_')}", lines, seen_hashes)
+                        if added > 0:
+                            model.docs.extend(lines[:added] if b_path else [])
+                        for vt in w_visited:
+                            visited_topics.add(str(vt).lower())
+                    resp = json.dumps({"status": "ok", "added": added}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(resp)
+                    if added > 0:
+                        print(f"\n[Cluster Host] Received +{added} new training docs from {worker_ip}")
+                except Exception as exc:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(str(exc).encode("utf-8"))
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1050,6 +1076,8 @@ def run_cluster_worker(host_addr: str, args, data_dir: str, seen_hashes: set[str
         if combined_text.strip():
             model.load_text(combined_text, fit_new=False)
 
+        docs_before = len(model.docs)
+
         # 2. Train 1 local cycle
         run_self_training_cycle(
             model=model,
@@ -1067,6 +1095,26 @@ def run_cluster_worker(host_addr: str, args, data_dir: str, seen_hashes: set[str
             grpo_rounds=args.grpo,
             save_path=local_ckpt,
         )
+
+        # 2b. Send any new training data crawled by this worker to the Host
+        new_worker_docs = model.docs[docs_before:]
+        if new_worker_docs:
+            try:
+                data_payload = json.dumps({
+                    "lines": new_worker_docs,
+                    "visited": list(visited_topics)[-200:],
+                }).encode("utf-8")
+                d_req = urllib.request.Request(
+                    f"{base_url}/submit_data",
+                    data=data_payload,
+                    method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                )
+                with urllib.request.urlopen(d_req, timeout=20) as d_resp:
+                    d_info = json.loads(d_resp.read().decode("utf-8"))
+                    print(f"[Cluster Worker] Sent +{d_info.get('added', 0)} new training docs to Host")
+            except Exception as exc:
+                print(f"[Cluster Worker] Data sync warning: {exc}")
 
         # 3. Push trained weights back to host for FedAvg merge
         with open(local_ckpt, "rb") as f:
@@ -1228,7 +1276,7 @@ def run() -> None:
     cluster_srv = None
     cluster_stop = None
     if args.host:
-        cluster_srv, cluster_stop = start_cluster_host(model, save_path, cluster_lock)
+        cluster_srv, cluster_stop = start_cluster_host(model, save_path, cluster_lock, data_dir, seen_hashes, visited_topics)
 
     cycle = 0
 

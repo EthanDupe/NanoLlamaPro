@@ -33,7 +33,7 @@ try:
     import torch.nn.functional as F
 
     HAS_TORCH = True
-except ImportError:
+except Exception:
     HAS_TORCH = False
 
 

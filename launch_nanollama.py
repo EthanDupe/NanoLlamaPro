@@ -26,7 +26,7 @@ import zipfile
 # Set this to your GitHub "username/repo" before sharing this file:
 DEFAULT_GITHUB_REPO = "EthanDupe/NanoLlamaPro"
 
-APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NanoLlamaPro_Files")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "launcher_config.json")
 USER_AGENT = "NanoLlamaPro-Launcher/1.0"
 
@@ -104,18 +104,20 @@ def ensure_packages(install_torch: bool = True) -> None:
         import numpy  # noqa: F401
     except ModuleNotFoundError:
         print("\nInstalling required package: numpy...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-warn-script-location", "numpy"])
     print_bar(1, 2, "Dependencies", "numpy OK")
 
     if install_torch:
         try:
             import torch  # noqa: F401
         except ModuleNotFoundError:
-            print("\nInstalling PyTorch (torch) for faster batched/GPU training...")
+            print("\nInstalling PyTorch (torch) for faster batched/GPU training...", flush=True)
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-warn-script-location", "torch"])
             except Exception as exc:
-                print(f"Skipping torch ({exc}); will use numpy-cpu.")
+                print(f"Skipping torch ({exc}); will use numpy-cpu.", flush=True)
+        except Exception as exc:
+            print(f"\nPyTorch import warning ({exc}); continuing with numpy-cpu.", flush=True)
     print_bar(2, 2, "Dependencies", "ready")
 
 
@@ -145,8 +147,11 @@ def sync_from_github(repo: str, force: bool = False) -> None:
 
         if assets:
             print(f"Found release {tag} ({len(assets)} file(s))!", flush=True)
+            has_zip = any(a["name"].lower().endswith(".zip") for a in assets)
             for asset in assets:
                 name = asset["name"]
+                if has_zip and name == "launch_nanollama.py":
+                    continue
                 dl_url = asset["browser_download_url"]
                 dest = os.path.join(APP_DIR, name)
                 download_file(dl_url, dest, label=f"Get {name[:9]}")

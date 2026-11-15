@@ -80,9 +80,11 @@ except ModuleNotFoundError:
         ans = "n"
     if ans in ("", "y", "yes"):
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-warn-script-location", "torch"])
         except Exception as exc:
             print(f"Could not install torch ({exc}). Continuing with numpy-cpu fallback...")
+except Exception as _torch_err:
+    print(f"PyTorch unavailable ({_torch_err}); continuing with numpy-cpu.")
 
 try:
     from nanollama_pro import HAS_TORCH, NanoLlamaUltra, get_best_device  # noqa: E402
